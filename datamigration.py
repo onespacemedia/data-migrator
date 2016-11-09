@@ -163,11 +163,14 @@ class Command(BaseCommand):
 
             # Try to auto-map columns (if they have the same name)
             for old_column in self.get_columns():
+                self.active_table = map_to
                 for new_column in self.get_local_columns():
                     if old_column == new_column or old_column == 'url_title' and new_column == 'slug':
                         if confirm('Would you like to map {} to {}?'.format(old_column, new_column)):
                             columns.append((old_column, new_column))
                         continue
+
+                self.active_table = table
 
             while not columns_selected:
                 if len(columns) > 0:
@@ -210,6 +213,7 @@ class Command(BaseCommand):
 
             # How many columns with a not-null constraint still exist?
             # Disabling pylint on the next line as it thinks the PSQL command is RegEx, it's not.
+            self.active_table = map_to
             null_columns = local('echo "\d {};" | psql -d {}'.format(  # pylint: disable=anomalous-backslash-in-string
                 table,
                 connection.settings_dict['NAME'],
@@ -288,24 +292,27 @@ class Command(BaseCommand):
             exit()
 
         for table in self.table_data:
-            local("""
-                psql -d {old_database} -c "copy(SELECT {old_fields}{null_values} FROM {old_table} {conditional}) to stdout" \
+            command = """
+                psql -d {old_database} -c 'copy(SELECT {old_fields}{null_values} FROM {old_table} {conditional}) to stdout' \
                 | \
-                psql -d {new_database} -c "COPY {new_table} ({new_fields}{other_columns}) from stdin"
+                psql -d {new_database} -c 'COPY {new_table} ({new_fields}{other_columns}) from stdin'
             """.format(
                 old_database=self.database,
-                old_fields=', '.join([pair[0] for pair in self.table_data[table]['columns']]),
+                old_fields=', '.join(['"{}"'.format(pair[0]) for pair in self.table_data[table]['columns']]),
                 old_table=table,
                 null_values='' if not self.table_data[table].get('other_columns', []) else '{}{}'.format(
                     ', ',
-                    ', '.join([pair[1] for pair in self.table_data[table]['other_columns']])
+                    ', '.join([pair[1].replace("'", "'\\''") for pair in self.table_data[table]['other_columns']])
                 ),
                 conditional=self.table_data[table]['export_conditional'] if self.table_data[table]['export_conditional'] else '',
                 new_database=connection.settings_dict['NAME'],
-                new_fields=', '.join([pair[1] for pair in self.table_data[table]['columns']]),
+                new_fields=', '.join(['"{}"'.format(pair[1]) for pair in self.table_data[table]['columns']]),
                 new_table=self.table_data[table]['map_to'],
                 other_columns='' if not self.table_data[table].get('other_columns', []) else '{}{}'.format(
                     ', ',
-                    ', '.join([pair[0] for pair in self.table_data[table]['other_columns']])
+                    ', '.join(['"{}"'.format(pair[0]) for pair in self.table_data[table]['other_columns']])
                 ),
-            ))
+            )
+
+            print "\n[{}] Running: {}".format(table, " ".join(command.split()))
+            local(command)
