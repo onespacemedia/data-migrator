@@ -202,6 +202,17 @@ class Command(BaseCommand):
                 ))
 
                 self.active_table = map_to
+
+                print '\nAlready mapped: {}'.format(
+                    ', '.join(column[1] for column in columns)
+                )
+                print 'Still mappable: {}'.format(
+                    ', '.join(
+                        old_column for old_column in self.get_local_columns()
+                        if old_column not in [column[0] for column in columns]
+                    )
+                )
+
                 column.append(prompt(
                     'Please select a column to map to:',
                     validate=self.validate_local_column
@@ -212,8 +223,8 @@ class Command(BaseCommand):
             self.table_data[table]['columns'] = columns
 
             # How many columns with a not-null constraint still exist?
-            # Disabling pylint on the next line as it thinks the PSQL command is RegEx, it's not.
             self.active_table = map_to
+            # Disabling pylint on the next line as it thinks the PSQL command is RegEx, it's not.
             null_columns = local('echo "\d {};" | psql -d {}'.format(  # pylint: disable=anomalous-backslash-in-string
                 table,
                 connection.settings_dict['NAME'],
@@ -250,7 +261,7 @@ class Command(BaseCommand):
             if confirm('\nWould you like to provide a conditional to the data exporter?'):
                 self.table_data[table]['export_conditional'] = prompt('What would you like it to be? (include the WHERE)')
 
-    def handle(self, *args, **options):
+    def handle(self, *args, **options):  # pylint: disable=too-complex, too-many-locals
         if options['file']:
             with open(options['file']) as f:
                 json_data = json.load(f)
@@ -274,10 +285,47 @@ class Command(BaseCommand):
         print 'To confirm, this is the mapping you have configured:\n'
 
         for table in self.table_data:
+            # Determine if any of the columns are `media_file` foreign keys.
+            foreign_keys = local(
+                """echo "SELECT
+                    kcu.column_name,
+                    ccu.table_name AS foreign_table_name,
+                    ccu.column_name AS foreign_column_name
+                FROM
+                    information_schema.table_constraints AS tc
+                    JOIN information_schema.key_column_usage AS kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                    JOIN information_schema.constraint_column_usage AS ccu
+                      ON ccu.constraint_name = tc.constraint_name
+                WHERE
+                    constraint_type = 'FOREIGN KEY' AND
+                    ccu.table_name = 'media_file' AND
+                    tc.table_name='{}'" | psql -d {}""".format(
+                        table,
+                        self.database
+                    ),
+                capture=True
+            )
+
+            foreign_keys = [
+                [x.strip() for x in foreign_key.split('|')]
+                for foreign_key in foreign_keys.split('\n')[2:-1]
+            ]
+
+            self.table_data[table]['foreign_keys'] = {
+                key[0]: (key[1], key[2])
+                for key in foreign_keys
+            }
+
             print '{} -> {}'.format(table, self.table_data[table]['map_to'])
 
             for column in self.table_data[table]['columns']:
-                print ' - {} -> {}'.format(*column)
+                print ' - {} -> {}{fk}'.format(
+                    *column,
+                    fk=' (FK to {}.{}, will attempt to migrate)'.format(
+                        *self.table_data[table]['foreign_keys'][column[0]]
+                    ) if column[0] in self.table_data[table]['foreign_keys'] else ''
+                )
 
             for null_column, null_value in self.table_data[table]['other_columns']:
                 print u' - Set `{}` to {}'.format(
@@ -291,14 +339,45 @@ class Command(BaseCommand):
             print 'Ok, bye.'
             exit()
 
+        # 1,073,741,824 -> pow(2, 30) (2^31-1 is the postgres maxint size)
+
         for table in self.table_data:
+            # If we have media files to transfer, we need to move those across
+            # first, otherwise we're going to get constraint errors.
+
+            for foreign_key in self.table_data[table]['foreign_keys']:
+                # {'thumbnail_id': ['media_file', 'id']}
+                fk_table, fk_column = self.table_data[table]['foreign_keys'][foreign_key]
+
+                # Backslashes are required because it's a multi-line bash command.
+                local(
+                    """
+                    psql -d {old_database} -c 'copy(SELECT {fk_column} + POW(2, 30) {fk_column}, title, file FROM {fk_table} WHERE {fk_column} IN (SELECT DISTINCT({column}) FROM {table} WHERE {column} IS NOT NULL)) TO STDOUT' \
+                    | \
+                    psql -d {new_database} -c 'COPY {fk_table} ({fk_column}, title, file) from stdin'
+                    """.format(
+                        old_database=self.database,
+                        new_database=connection.settings_dict['NAME'],
+                        fk_table=fk_table,
+                        fk_column=fk_column,
+                        column=foreign_key,
+                        table=table,
+                    )
+                )
+
             command = """
                 psql -d {old_database} -c 'copy(SELECT {old_fields}{null_values} FROM {old_table} {conditional}) to stdout' \
                 | \
                 psql -d {new_database} -c 'COPY {new_table} ({new_fields}{other_columns}) from stdin'
             """.format(
                 old_database=self.database,
-                old_fields=', '.join(['"{}"'.format(pair[0]) for pair in self.table_data[table]['columns']]),
+                old_fields=', '.join([
+                    '"{}"{}'.format(
+                        pair[0],
+                        ' + POW(2, 30)' if pair[0] in self.table_data[table]['foreign_keys'] else ''
+                    )
+                    for pair in self.table_data[table]['columns']
+                ]),
                 old_table=table,
                 null_values='' if not self.table_data[table].get('other_columns', []) else '{}{}'.format(
                     ', ',
@@ -314,5 +393,40 @@ class Command(BaseCommand):
                 ),
             )
 
-            print "\n[{}] Running: {}".format(table, " ".join(command.split()))
+            print "\n[{} -> {}] Running: {}\n".format(
+                table,
+                self.table_data[table]['map_to'],
+                " ".join(command.split())
+            )
             local(command)
+
+            # At this point we need to change any references to files with an ID
+            # of >pow(2, 30) to fit into the sequence, but at the same time we
+            # need to store what the new ID is so that we don't duplicate the
+            # files on subsequent loops.
+
+            for foreign_key in self.table_data[table]['foreign_keys']:
+                if foreign_key in dict(self.table_data[table]['columns']):
+                    # {'thumbnail_id': ['media_file', 'id']}
+                    fk_table, fk_column = self.table_data[table]['foreign_keys'][foreign_key]
+
+                    print table, foreign_key, fk_table, fk_column
+
+                    with connection.cursor() as cursor:
+                        cursor.execute("""
+                            DO $$
+                              DECLARE
+                                media_id integer;
+                              BEGIN
+                                FOR media_id IN SELECT {fk_column} FROM {fk_table} WHERE {fk_column} > POW(2, 30)
+                                LOOP
+                                  UPDATE {fk_table} SET {fk_column} = nextval('{fk_table}_{fk_column}_seq') WHERE {fk_column} = media_id;
+                                  UPDATE {table} SET {new_field} = currval('{fk_table}_{fk_column}_seq') WHERE {new_field} = media_id;
+                                END LOOP;
+                            END $$;
+                        """.format(
+                            fk_table=fk_table,
+                            fk_column=fk_column,
+                            table=self.table_data[table]['map_to'],
+                            new_field=dict(self.table_data[table]['columns'])[foreign_key]
+                        ))
