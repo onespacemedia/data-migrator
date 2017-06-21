@@ -7,6 +7,8 @@ from django.db import connection
 from fabric.api import local, prompt  # pylint: disable=ungrouped-imports
 from fabric.contrib.console import confirm
 
+from os import path
+
 fabric.state.output['running'] = False
 
 VALIDATION_ERROR = """{selection} is not a valid option, please select from one
@@ -20,6 +22,8 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument('--database', help='Specify which database to use')
         parser.add_argument('--file', help='Load config from a JSON file')
+        parser.add_argument('--media_from', help='The Media directory to copy files from')
+        parser.add_argument('--media_to', help='The Media directory to copy files to')
 
     def get_databases(self):
         databases = local('echo "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname;" | psql', capture=True)
@@ -261,12 +265,33 @@ class Command(BaseCommand):
             if confirm('\nWould you like to provide a conditional to the data exporter?'):
                 self.table_data[table]['export_conditional'] = prompt('What would you like it to be? (include the WHERE)')
 
+        self.media_from = None
+        self.media_to = None
+
+        if options['media_from']:
+            self.media_from = options['media_from']
+
+        if options['media_to']:
+            self.media_to = options['media_to']
+
+        if confirm('Would you like to copy across media files from another project?'):
+            if not self.media_from:
+                self.media_from = prompt('Please enter the directory from which to copy media files:')
+            if not self.media_to:
+                self.media_to = prompt('Please enter the directory to copy media files to:')
+        else:
+            self.media_from = None
+            self.media_to = None
+
+
     def handle(self, *args, **options):  # pylint: disable=too-complex, too-many-locals
         if options['file']:
             with open(options['file']) as f:
                 json_data = json.load(f)
                 self.table_data = json_data['table_data']
                 self.database = json_data['database']
+                self.media_from = json_data['media_from']
+                self.media_to = json_data['media_to']
         else:
             self.build_table_data(*args, **options)
 
@@ -277,7 +302,9 @@ class Command(BaseCommand):
                 with open(json_filename, 'w') as f:
                     json.dump({
                         'table_data': self.table_data,
-                        'database': self.database
+                        'database': self.database,
+                        'media_from': self.media_from,
+                        'media_to': self.media_to
                     }, f, indent=2)
 
         # Confirm all of the actions before executing.
@@ -344,6 +371,30 @@ class Command(BaseCommand):
         for table in self.table_data:
             # If we have media files to transfer, we need to move those across
             # first, otherwise we're going to get constraint errors.
+
+            # Copy across the files from the other media directory to the one referenced by this database
+            if self.media_from and self.media_to:
+                print self.table_data[table]['foreign_keys']
+                for foreign_key in self.table_data[table]['foreign_keys']:
+                    # {'thumbnail_id': ['media_file', 'id']}
+                    fk_table, fk_column = self.table_data[table]['foreign_keys'][foreign_key]
+
+                    file_names = local('echo "SELECT file FROM {fk_table} WHERE {fk_column} IN (SELECT DISTINCT({column}) FROM {table} WHERE {column} IS NOT NULL)" | psql -d {old_database}'.format(
+                        old_database=self.database,
+                        fk_table=fk_table,
+                        fk_column=fk_column,
+                        column=foreign_key,
+                        table=table,
+                    ), capture=True)
+
+                    file_names = [file.strip() for file in file_names.split('\n')[2:-1]]
+
+                    for file in file_names:
+                        local('cp {file_from} {file_to}'.format(
+                            file_from=path.join(self.media_from, file),
+                            file_to=path.join(self.media_to, file),
+                            )
+                        )
 
             for foreign_key in self.table_data[table]['foreign_keys']:
                 # {'thumbnail_id': ['media_file', 'id']}
