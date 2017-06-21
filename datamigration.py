@@ -265,6 +265,9 @@ class Command(BaseCommand):
             if confirm('\nWould you like to provide a conditional to the data exporter?'):
                 self.table_data[table]['export_conditional'] = prompt('What would you like it to be? (include the WHERE)')
 
+        self.media_from = None
+        self.media_to = None
+
         if options['media_from']:
             self.media_from = options['media_from']
 
