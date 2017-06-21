@@ -376,9 +376,6 @@ class Command(BaseCommand):
                     # {'thumbnail_id': ['media_file', 'id']}
                     fk_table, fk_column = self.table_data[table]['foreign_keys'][foreign_key]
 
-                    print fk_table
-                    print fk_column
-
                     file_names = local('echo "SELECT file FROM {fk_table} WHERE {fk_column} IN (SELECT DISTINCT({column}) FROM {table} WHERE {column} IS NOT NULL)" | psql -d {old_database}'.format(
                         old_database=self.database,
                         fk_table=fk_table,
@@ -388,8 +385,6 @@ class Command(BaseCommand):
                     ), capture=True)
 
                     file_names = [file.strip() for file in file_names.split('\n')[2:-1]]
-
-                    print file_names
 
                     for file in file_names:
                         local('cp {file_from} {file_to}'.format(
